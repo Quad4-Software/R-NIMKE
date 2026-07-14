@@ -1,4 +1,4 @@
-R-NIMKE
+# R-NIMKE
 
 EXPERIMENTAL - DO NOT USE
 
@@ -13,9 +13,7 @@ No LLMs were used in the creation of this document or cryptographic protocol. It
 
 R-NIMKE is a way to allow for low-bandwidth and Reticulum Zen compatible encrypted group messaging over Reticulum Network Stack keeping large and small groups in mind. 
 
-===
-CRYPTOGRAPHIC PRIMITIVES
-===
+## CRYPTOGRAPHIC PRIMITIVES
 
   Identity / signatures:
     - Ed25519 signatures for group state
@@ -35,9 +33,7 @@ CRYPTOGRAPHIC PRIMITIVES
   Randomness:
     - 32-byte secrets from a CSPRNG
 
-===
-THREAT MODEL
-===
+## THREAT MODEL
 
 The adversary may:
 
