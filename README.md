@@ -28,20 +28,20 @@ Markqvist's take in [702](https://github.com/markqvist/Reticulum/discussions/702
 
 Hostile network. Bytes on the air are expensive. CPU and disk are not. One admin signs membership. If that admin key burns, abandon the group. Keep the mechanisms intentionally boring.
 
-Rekey at N=16 is about 3.2 KiB once (state 1292 + keydist 1978). Wire `member_count` is uint16, but v1 apps must refuse anything above 16. Bigger communities: several small groups. Seals can also move paper / OOB when flooding keydist is too rich.
+Rekey at N=16 is about 3.9 KiB once (state 1292 bytes, keydist 2682 bytes). Wire `member_count` is uint16, but v1 apps must refuse anything above 16. Bigger communities: several small groups. Seals can also move paper / OOB when flooding keydist is too rich.
 
 ## Threat model
 
 Adversary can read links, keep ciphertext forever, inject/reorder/replay/drop, run bad peers or prop nodes, feed stale signed states to clients that ignore monotonic rules, partition members onto different highest `state_seq`, crash or roll devices back to reuse counters, compromise a member later, or steal the admin key (group burned).
 
-Assumed unbroken on honest devices: X25519, Ed25519, ChaCha20-Poly1305 / XChaCha20-Poly1305, HKDF-SHA256, SHA-256, CSPRNG.
+Assumed unbroken on honest devices: the Reticulum primitive suite (X25519, Ed25519, HKDF-SHA256, AES-256-CBC, HMAC-SHA256, SHA-256, SHA-512) and a CSPRNG. R-GKD does not introduce other ciphers.
 
 ## Claims
 
 What we try for:
 
 - Confidentiality for holders of the GRS used to derive keys
-- Integrity via AEAD
+- Integrity via RNS Token (AES-256-CBC + HMAC-SHA256)
 - Membership authenticity via admin Ed25519 + local monotonic `state_seq`
 - Keydist authenticity: admin signs keydist, signed state commits to GRS (`grs_commit`), so a forged seal cannot swap in a different secret
 - Kick: removed members do not get GRS_{v+1} (does not heal an attacker who still owns a remaining device)
@@ -94,6 +94,8 @@ If a receiver cannot resolve a row yet: store the signed state, mark the member 
 
 GRS_v is 32 CSPRNG bytes on create/rekey.
 
+Primitives match Reticulum: Ed25519, X25519, HKDF-SHA256, AES-256-CBC, HMAC-SHA256, SHA-256. Confidentiality and integrity use the same **RNS Token** construction as Identity encryption (Fernet-like: random IV, PKCS7, AES-256-CBC, HMAC-SHA256 over IV||ciphertext). Token keys are 64 bytes (HMAC half || AES half).
+
 Epoch keys are **direct** HKDF from GRS. No hash chain from t=0. TIME_BUCKET epochs around 2^24 to 2^25 must stay O(1).
 
 ```
@@ -104,13 +106,13 @@ SK_s,v,t = HKDF(CK_v,t, salt=GroupID,
                 info="RGKD1-SENDER" || MemberID_s || be32(v) || be32(t), 32)
 
 MK = HKDF(SK_s,v,t, salt=GroupID,
-          info="RGKD1-MSG" || be32(c_s), 32)
+          info="RGKD1-MSG" || be32(c_s), 64)
 
-nonce_12 = SHA-256("RGKD1-NONCE" || GroupID || MemberID_s ||
-                   be32(v) || be32(t) || be32(c_s))[0:12]
+token = RNS_Token_Encrypt(MK, plaintext)
+# token = IV (16) || AES-CBC-PKCS7(ciphertext) || HMAC-SHA256 (32)
 ```
 
-Format 1 encrypts with ChaCha20-Poly1305(MK, nonce_12).
+Format 1 (only ordinary format in v1) places `token` after the fixed header. MK uniqueness comes from the counter. Each Token carries its own random IV.
 
 ### Epoch policy
 
@@ -126,11 +128,9 @@ In signed state.
 
 ### Counters and crashes
 
-Never encrypt two different plaintexts under the same (key, nonce).
+Never encrypt two different plaintexts under the same Token key with a colliding IV. RNS Token picks a fresh random IV per encrypt, so the practical rule is: do not reuse an MK after you cannot prove it was unused.
 
-Format 1 derives both MK and nonce_12 from `(GroupID, MemberID, state_seq, epoch, counter)`. Atomically reserve counter `c` in stable storage before constructing or transmitting a message that uses `c`. Once reserved, treat `c` as consumed even if transmission fails or the process crashes. After crash or backup restore, if you cannot prove the next unused counter, advance epoch (LOCAL_COUNTER), wait for the next time bucket (TIME_BUCKET) and reset the counter high-water, or use format 2 carefully.
-
-Format 2 is XChaCha20-Poly1305 with a random 24-byte nonce. Fresh unique nonces with one MK are fine for XChaCha. Device rollback can also roll RNG state. If you cannot guarantee a nonce was never used with that MK, change MK first (new epoch / fresh reserved counter after persistence is healthy). Prefer format 1 on tight links when persistence works.
+Atomically reserve counter `c` in stable storage before constructing or transmitting a message that uses `c`. Once reserved, treat `c` as consumed even if transmission fails or the process crashes. After crash or backup restore, if you cannot prove the next unused counter, advance epoch (LOCAL_COUNTER) or wait for the next time bucket (TIME_BUCKET) and reset the counter high-water.
 
 ### Replay
 
@@ -141,7 +141,7 @@ Receive order (important):
 1. Tentative check only (do not mutate window state):
    - if `max_c` is set and `c <= max_c` and `max_c - c >= window_size`: too old, drop
    - if `c` is already marked seen: drop
-2. Attempt AEAD authentication and any required member signature
+2. Attempt Token authentication (HMAC then decrypt) and any required member signature
 3. Only after both succeed: mark `c` seen, and if `c > max_c` set `max_c = c` (trim the bitset)
 4. Deliver
 
@@ -205,12 +205,10 @@ Seal:
 eph_pub, eph_priv = X25519_Generate()
 ss = X25519(eph_priv, MemberPub_i)
 # Reject all-zero MemberPub and all-zero ss
-seal_key = HKDF(ss, salt=GroupID, info="RGKD1-SEAL" || MemberID_i, 32)
+seal_key = HKDF(ss, salt=GroupID, info="RGKD1-SEAL" || MemberID_i, 64)
 plaintext = GRS (32) || group_id (16) || be32(state_seq)
-nonce_12 = SHA-256("RGKD1-SEAL" || eph_pub || MemberID_i || be32(state_seq))[0:12]
-AAD = group_id || be32(state_seq) || MemberID_i
-ct||tag = ChaCha20-Poly1305(seal_key, nonce_12, AAD, plaintext)
-SealBlob = eph_pub (32) || ct||tag (68)
+token = RNS_Token_Encrypt(seal_key, plaintext)
+SealBlob = eph_pub (32) || token (112 for this plaintext size)
 ```
 
 Keydist (then admin signature over prior fields):
@@ -222,47 +220,43 @@ Keydist (then admin signature over prior fields):
 | state_seq | 4 |
 | state_hash | 32 (SHA-256 of accepted state_body) |
 | recipient_count | 2 |
-| recipients | N × (MemberID 16 + SealBlob 100) |
+| recipients | N × (MemberID 16 + SealBlob 144) |
 | signature | 64 |
 
 Verify signature, match state_hash, unseal, check grs_commit. Reject bad magic, recipient_count > 16, duplicate MemberIDs, missing local seal when you are on the roster, invalid X25519 / all-zero shared secret. If next `state_seq` would overflow uint32, start a new group.
 
-Size: 122 + 116N (1978 at N=16).
+Size: 122 + 160N bytes (2682 at N=16).
 
 ## Ordinary messages
 
 | Field | Size |
 |-------|------|
 | magic | 2 (0x4731) |
-| format | 1 (1 = counter ChaCha, 2 = XChaCha) |
+| format | 1 (1 = RNS Token) |
 | flags | 1 (bit0 = member signature) |
 | group_trunc | 8 |
 | state_seq | 4 |
 | epoch | 4 |
 | sender_trunc | 8 |
 | counter | 4 |
-| nonce24 | 0 or 24 (format 2) |
-| ciphertext | variable (includes 16-byte tag) |
+| token | variable (IV || ciphertext || HMAC) |
 | signature | 0 or 64 |
 
-Format 1 header 32 bytes, format 2 is 56. Epoch advance itself costs no airtime.
+Header is 32 bytes. Epoch advance itself costs no airtime.
 
-Minimum lengths (reject shorter before splitting ciphertext vs signature):
+Minimum lengths (reject shorter before splitting token vs signature):
 
-- format 1 unsigned: 32 + 16
-- format 2 unsigned: 56 + 16
+- unsigned: 32 + 64 (empty plaintext Token)
 - with member signature: add a full 64-byte signature
-- ciphertext portion must be at least the 16-byte AEAD tag
-
-**AAD:** magic through counter (format 1), or through nonce24 (format 2). Ciphertext is AEAD output including tag.
+- token must be at least RNS Token overhead (48) plus one AES block (16)
 
 **Truncations:** leading 8 bytes of GroupID / MemberID. Zero matches -> buffer or drop. More than one -> must drop. Admins must not assign colliding MemberID prefixes. Create must reject GroupID that collides on 8 bytes with another active group on the device.
 
-**Member signatures:** if bit0 set, Ed25519 over `header_without_signature || ciphertext` (ciphertext includes tag). Verify under the bound Ed25519 half. Fail -> drop. Bit clear means AEAD only: any current member can impersonate content. Attributable chat sets the bit. v1: `flags & ~KNOWN_MSG_FLAGS == 0` or reject (known bit: has signature).
+**Member signatures:** if bit0 set, Ed25519 over `header_without_signature || token`. Verify under the bound Ed25519 half. Fail -> drop. Bit clear means Token auth only: any current member can impersonate content. Attributable chat sets the bit. v1: `flags & ~KNOWN_MSG_FLAGS == 0` or reject (known bit: has signature).
 
 **Send:** activated state, epoch under policy, reserve next counter under crash rules. Exhausted uint32 with nowhere to go -> rekey or new group.
 
-**Receive:** resolve truncations -> fetch unknown/newer state+keydist if needed -> roster for that state_seq (pending senders cannot be attributable) -> tentative replay check -> decrypt -> optional sig -> commit replay -> deliver.
+**Receive:** resolve truncations -> fetch unknown/newer state+keydist if needed -> roster for that state_seq (pending senders cannot be attributable) -> tentative replay check -> Token decrypt -> optional sig -> commit replay -> deliver.
 
 ### Interop rejects
 
@@ -274,7 +268,7 @@ Minimum lengths (reject shorter before splitting ciphertext vs signature):
 | Unknown message flag bits | reject |
 | Unknown state flag bits | reject |
 | Ordinary message below minimum length | reject |
-| Ciphertext shorter than AEAD tag | reject |
+| Token shorter than RNS Token minimum | reject |
 | extensions_len != 0 (v1) | reject |
 | member_count or recipient_count > 16 | reject |
 | Duplicate member or keydist rows | reject |
@@ -292,7 +286,7 @@ Only the awkward names:
 | GRS_v | Group root secret for state version v |
 | CK_v,t | Epoch key. Direct HKDF from GRS (not a chain) |
 | keydist | Signed object with SealBlobs (magic RG1K) |
-| SealBlob | Ephemeral X25519 wrap of GRS to one MemberPub |
+| SealBlob | Ephemeral X25519 wrap of GRS to one MemberPub using an RNS Token |
 | pending | Roster row accepted but not identity-bound yet |
 | grace | Window after rekey when v-1 keys may still open late mail |
 | burned | Abandon the group (admin compromise or conflicting same-seq states) |
